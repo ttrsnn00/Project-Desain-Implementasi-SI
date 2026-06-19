@@ -1,0 +1,66 @@
+services:
+  # 1. DATABASE MYSQL (Healthcheck Ditambahkan)
+  kampus-db:
+    image: mysql:8.0
+    container_name: kampus-db-container
+    environment:
+      MYSQL_ROOT_PASSWORD: rahasia_db_password
+      MYSQL_DATABASE: db_pocket_money
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 10s
+
+  # 2. MICROSERVICE: AUTH (Menunggu MySQL siap)
+  auth-service:
+    build: ./auth-service
+    ports:
+      - "4001:4001"
+    environment:
+      - PORT=4001
+    depends_on:
+      kampus-db:
+        condition: service_healthy
+
+  # 3. MICROSERVICE: KAMPUS BILLING (Menunggu MySQL siap)
+  campus-billing-service:
+    build: ./campus-billing-service
+    ports:
+      - "4002:4002"
+    environment:
+      - PORT=4002
+    depends_on:
+      kampus-db:
+        condition: service_healthy
+
+  # 4. MICROSERVICE: POCKET MONEY (Menunggu MySQL siap)
+  pocket-money-service:
+    build: ./pocket-money-service
+    ports:
+      - "4003:4003"
+    environment:
+      - PORT=4003
+    depends_on:
+      kampus-db:
+        condition: service_healthy
+
+  # 5. API GATEWAY (Menunggu semua Microservices siap)
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "4000:4000"
+    environment:
+      - PORT=4000
+    depends_on:
+      - auth-service
+      - campus-billing-service
+      - pocket-money-service
+
+volumes:
+  mysql_data:
