@@ -1,28 +1,53 @@
+require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
 const app = express();
-const PORT = 4001;
-const JWT_SECRET = 'rahasia_super_helena_finance_2026';
+const PORT = process.env.PORT || 4001;
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+    console.error('❌ JWT_SECRET tidak ditemukan di environment variables. Cek file .env!');
+    process.exit(1);
+}
 
 app.use(express.json());
 
-const db = mysql.createConnection({
-    host: 'kampus-db',
-    user: 'root',
-    password: 'rahasia_db_password',
-    database: 'db_pocket_money'
+// Pakai connection POOL (bukan createConnection tunggal) supaya otomatis
+// reconnect kalau koneksi pertama gagal/putus -- mencegah service "mati permanen"
+// kalau MySQL belum benar-benar siap saat service ini pertama kali start.
+const db = mysql.createPool({
+    host: process.env.DB_HOST || 'kampus-db',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME || 'db_auth',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
-db.connect(err => {
-    if (err) {
-        console.error('❌ Gagal koneksi ke MySQL:', err.message);
-        return;
-    }
-    console.log('🚀 Terhubung ke MySQL Kampus DB (Auth Service)!');
-    
+// Tes koneksi awal dengan retry, supaya error di log jelas dan tabel
+// langsung dibuat begitu MySQL benar-benar siap (bukan baru saat query pertama masuk).
+function connectWithRetry(retriesLeft = 10) {
+    db.getConnection((err, connection) => {
+        if (err) {
+            console.error(`❌ Gagal koneksi ke MySQL (sisa percobaan: ${retriesLeft}):`, err.message);
+            if (retriesLeft > 0) {
+                setTimeout(() => connectWithRetry(retriesLeft - 1), 3000);
+            } else {
+                console.error('❌ Menyerah mencoba konek ke MySQL setelah beberapa kali percobaan.');
+            }
+            return;
+        }
+        connection.release();
+        console.log('🚀 Terhubung ke MySQL Kampus DB (Auth Service)!');
+        initTable();
+    });
+}
+
+function initTable() {
     // PERUBAHAN: Penambahan kolom 'role' dengan default 'mahasiswa'
     const createTable = `
         CREATE TABLE IF NOT EXISTS users (
@@ -38,16 +63,23 @@ db.connect(err => {
         db.query("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'", async (err, results) => {
             // PERUBAHAN: Injeksi akun Admin otomatis jika belum ada
             if (results[0].count === 0) {
-                const hashedPassword = await bcrypt.hash('admin123', 10);
+                const adminPassword = process.env.ADMIN_DEFAULT_PASSWORD;
+                if (!adminPassword) {
+                    console.error('❌ ADMIN_DEFAULT_PASSWORD tidak ditemukan di environment variables. Akun admin tidak dibuat otomatis.');
+                    return;
+                }
+                const hashedPassword = await bcrypt.hash(adminPassword, 10);
                 const insertAdmin = `
                     INSERT INTO users (nim, password, nama, role) 
-                    VALUES ('admin', '${hashedPassword}', 'Administrator Kampus', 'admin')
+                    VALUES (?, ?, 'Administrator Kampus', 'admin')
                 `;
-                db.query(insertAdmin, () => console.log('👑 Akun Admin (NIM: admin) berhasil dibuat!'));
+                db.query(insertAdmin, ['admin', hashedPassword], () => console.log('👑 Akun Admin (NIM: admin) berhasil dibuat!'));
             }
         });
     });
-});
+}
+
+connectWithRetry();
 
 app.post('/register', async (req, res) => {
     const { nim, nama, password } = req.body;
@@ -117,6 +149,41 @@ app.put('/profile', async (req, res) => {
     } catch (error) {
         res.status(500).json({ status: 'error', message: 'Error server.', data: null });
     }
+});
+
+// --- MIDDLEWARE OTORISASI ---
+// Sama seperti pola di campus-billing-service & pocket-money-service:
+// identitas user diteruskan oleh API Gateway via header (sudah diverifikasi
+// JWT di sana). Endpoint ini KHUSUS admin.
+const requireAdmin = (req, res, next) => {
+    if (req.headers['x-user-role'] !== 'admin') {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Hanya admin yang dapat mengakses endpoint ini.',
+            data: null
+        });
+    }
+    next();
+};
+
+// --- ENDPOINT KHUSUS ADMIN: DAFTAR SEMUA MAHASISWA ---
+// Dipakai admin untuk melihat siapa saja yang sudah daftar, supaya bisa
+// tahu mahasiswa mana yang BELUM punya tagihan UKT (dicek silang manual
+// dengan data dari campus-billing-service, karena dua data ini ada di
+// database terpisah -- lihat catatan di bawah).
+app.get('/users', requireAdmin, (req, res) => {
+    // Sengaja TIDAK menyertakan kolom password, sekalipun sudah ter-hash --
+    // tidak perlu dikirim ke frontend sama sekali.
+    db.query(
+        "SELECT nim, nama, role FROM users WHERE role = 'mahasiswa' ORDER BY nim",
+        (err, results) => {
+            if (err) {
+                console.error('Gagal mengambil daftar mahasiswa:', err);
+                return res.status(500).json({ status: 'error', message: 'Kesalahan sistem.', data: null });
+            }
+            res.status(200).json({ status: 'success', message: 'Daftar mahasiswa berhasil diambil.', data: results });
+        }
+    );
 });
 
 app.listen(PORT, '0.0.0.0', () => {
