@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/api_config.dart';
+import '../utils/token_storage.dart';
 import 'dashboard_screen.dart';
+import 'admin_dashboard_screen.dart';
 import 'register_screen.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -47,13 +48,14 @@ class _LoginScreenState extends State<LoginScreen> {
 
       // Mengecek respons menggunakan standar JSON yang baru
       if (response.statusCode == 200 && jsonResponse['status'] == 'success') {
-        // Ekstrak token dan nim dari dalam objek 'data'
+        // Ekstrak token, nim, dan role dari dalam objek 'data'
         String token = jsonResponse['data']['token'];
         String nim = jsonResponse['data']['nim'];
+        String role = jsonResponse['data']['role'] ?? 'mahasiswa';
 
-        // Simpan token ke penyimpanan lokal
-        SharedPreferences prefs = await SharedPreferences.getInstance();
-        await prefs.setString('token', token);
+        // Simpan token & role ke penyimpanan AMAN (terenkripsi), bukan SharedPreferences
+        await TokenStorage.saveToken(token);
+        await TokenStorage.saveRole(role);
 
         if (mounted) {
           // Tampilkan pesan selamat datang
@@ -61,11 +63,19 @@ class _LoginScreenState extends State<LoginScreen> {
             SnackBar(content: Text(jsonResponse['message']), backgroundColor: Colors.green),
           );
 
-          // Pindah ke Dashboard
-          Navigator.pushReplacement(
-            context,
-            MaterialPageRoute(builder: (context) => DashboardScreen(nim: nim)),
-          );
+          // Admin diarahkan ke dashboard admin (kelola tagihan mahasiswa),
+          // mahasiswa diarahkan ke dashboard biasa.
+          if (role == 'admin') {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(builder: (context) => const AdminDashboardScreen()),
+            );
+          } else {
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(builder: (context) => DashboardScreen(nim: nim)),
+            );
+          }
         }
       } else {
         // Jika status error (misal: password salah, NIM tidak ada)
@@ -130,7 +140,6 @@ class _LoginScreenState extends State<LoginScreen> {
                 // Form NIM
                 TextField(
                   controller: _nimController,
-                  keyboardType: TextInputType.number,
                   decoration: InputDecoration(
                     labelText: 'NIM Mahasiswa',
                     prefixIcon: const Icon(Icons.person_outline),

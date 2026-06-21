@@ -1,13 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'; 
 import 'package:provider/provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:intl/intl.dart';
 
 import '../providers/keuangan_provider.dart';
 import '../config/api_config.dart';
+import '../utils/token_storage.dart';
 import 'login_screen.dart';
 import 'profile_screen.dart'; 
 
@@ -51,8 +51,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   // --- FUNGSI LOGOUT ---
   Future<void> _logout() async {
-    SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.remove('token');
+    await TokenStorage.deleteToken();
+    await TokenStorage.deleteRole();
     if (mounted) {
       Navigator.pushReplacement(
         context,
@@ -94,8 +94,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     Navigator.pop(context);
     
     try {
-      SharedPreferences prefs = await SharedPreferences.getInstance();
-      String? token = prefs.getString('token');
+      String? token = await TokenStorage.getToken();
       
       final response = await http.post(
         Uri.parse('${ApiConfig.baseUrl}/uang-saku/transaksi'),
