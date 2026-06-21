@@ -1,0 +1,12 @@
+# Secrets - JANGAN PERNAH commit file ini
+.env
+
+# Dependencies
+node_modules/
+
+# Logs
+npm-debug.log*
+*.log
+
+# OS files
+.DS_Store
