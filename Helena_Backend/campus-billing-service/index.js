@@ -1,26 +1,43 @@
+require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2');
 
 const app = express();
-const PORT = 4002;
+const PORT = process.env.PORT || 4002;
 
 app.use(express.json());
 
-// Koneksi ke Database Utama
-const db = mysql.createConnection({
-    host: 'kampus-db', 
-    user: 'root',
-    password: 'rahasia_db_password',
-    database: 'db_pocket_money' // Kita gabungkan di database yang sama untuk efisiensi
+// Koneksi ke Database khusus Billing (terpisah dari service lain)
+// Pakai connection POOL supaya otomatis reconnect, bukan mati permanen
+// kalau MySQL belum benar-benar siap saat service ini pertama kali start.
+const db = mysql.createPool({
+    host: process.env.DB_HOST || 'kampus-db',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME || 'db_billing',
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0
 });
 
-db.connect(err => {
-    if (err) {
-        console.error('❌ Gagal koneksi ke MySQL:', err.message);
-        return;
-    }
-    console.log('🚀 Terhubung ke MySQL Kampus DB!');
-    
+function connectWithRetry(retriesLeft = 10) {
+    db.getConnection((err, connection) => {
+        if (err) {
+            console.error(`❌ Gagal koneksi ke MySQL (sisa percobaan: ${retriesLeft}):`, err.message);
+            if (retriesLeft > 0) {
+                setTimeout(() => connectWithRetry(retriesLeft - 1), 3000);
+            } else {
+                console.error('❌ Menyerah mencoba konek ke MySQL setelah beberapa kali percobaan.');
+            }
+            return;
+        }
+        connection.release();
+        console.log('🚀 Terhubung ke MySQL Kampus DB!');
+        initTable();
+    });
+}
+
+function initTable() {
     // 1. Buat Tabel Tagihan
     const createTable = `
         CREATE TABLE IF NOT EXISTS tagihan (
@@ -51,10 +68,41 @@ db.connect(err => {
             }
         });
     });
-});
+}
+
+connectWithRetry();
+
+// --- MIDDLEWARE OTORISASI ---
+// Identitas user diteruskan oleh API Gateway via header (sudah diverifikasi JWT di sana).
+// Mahasiswa hanya boleh akses data miliknya sendiri; admin boleh akses semua.
+const authorizeOwnerOrAdmin = (req, res, next) => {
+    const requesterNim = req.headers['x-user-nim'];
+    const requesterRole = req.headers['x-user-role'];
+    const targetNim = req.params.nim;
+
+    if (requesterRole === 'admin' || requesterNim === targetNim) {
+        return next();
+    }
+    return res.status(403).json({
+        status: 'error',
+        message: 'Anda tidak memiliki akses ke data mahasiswa lain.',
+        data: null
+    });
+};
+
+const requireAdmin = (req, res, next) => {
+    if (req.headers['x-user-role'] !== 'admin') {
+        return res.status(403).json({
+            status: 'error',
+            message: 'Hanya admin yang dapat mengakses endpoint ini.',
+            data: null
+        });
+    }
+    next();
+};
 
 // Endpoint GET Data Tagihan dari MySQL
-app.get('/tagihan/:nim', (req, res) => {
+app.get('/tagihan/:nim', authorizeOwnerOrAdmin, (req, res) => {
     const studentNim = req.params.nim;
     
     db.query('SELECT * FROM tagihan WHERE nim = ?', [studentNim], (err, results) => {
@@ -86,7 +134,7 @@ app.get('/tagihan/:nim', (req, res) => {
 });
 
 // --- ENDPOINT BARU KHUSUS ADMIN: MENERBITKAN TAGIHAN UKT ---
-app.post('/tagihan', (req, res) => {
+app.post('/tagihan', requireAdmin, (req, res) => {
     const { nim, ukt_total } = req.body;
 
     if (!nim || !ukt_total) {
@@ -115,29 +163,153 @@ app.post('/tagihan', (req, res) => {
 });
 
 // --- ENDPOINT PEMBAYARAN UKT (MAHASISWA) ---
-app.put('/tagihan/:nim/bayar', (req, res) => {
+// Versi baru: rollback sekarang jadi tanggung jawab SERVER, bukan Flutter.
+//
+// Alur:
+//   1. Tandai tagihan jadi 'Lunas' di db_billing
+//   2. Panggil pocket-money-service (service-to-service) untuk catat pengeluaran
+//   3a. Kalau (2) berhasil  → balas Flutter dengan sukses
+//   3b. Kalau (2) gagal     → rollback langsung di server (kembalikan ke 'Belum Lunas')
+//                              dan balas Flutter dengan error
+//
+// Trade-off yang disadari: campus-billing-service sekarang bergantung pada
+// pocket-money-service untuk operasi ini. Kalau pocket-money-service mati,
+// pembayaran UKT juga akan gagal (tapi data tidak akan pernah setengah-jalan).
+// Ini keputusan desain: konsistensi data diprioritaskan di atas independensi service.
+const http = require('http');
+
+app.put('/tagihan/:nim/bayar', authorizeOwnerOrAdmin, async (req, res) => {
     const nim = req.params.nim;
-    
-    // Query ini akan mengubah ukt_dibayar menjadi sama dengan ukt_total, dan status jadi Lunas
-    const updateQuery = `
-        UPDATE tagihan 
-        SET ukt_dibayar = ukt_total, status = 'Lunas' 
-        WHERE nim = ? AND status != 'Lunas'
-    `;
-    
-    db.query(updateQuery, [nim], (err, result) => {
-        if (err) {
-            console.error(err);
-            return res.status(500).json({ status: 'error', message: 'Gagal memproses pembayaran.', data: null });
+
+    // Ambil data tagihan dulu, supaya kita tahu nominal yang harus dicatat
+    // sebagai transaksi pengeluaran di pocket-money-service.
+    let nominalUKT;
+    try {
+        const [rows] = await db.promise().query(
+            'SELECT ukt_total FROM tagihan WHERE nim = ? AND status != ?',
+            [nim, 'Lunas']
+        );
+        if (rows.length === 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Tagihan sudah lunas atau tidak ditemukan.',
+                data: null
+            });
         }
-        
-        // Jika tidak ada baris yang berubah, berarti tagihan sudah lunas atau NIM tidak ada
+        nominalUKT = rows[0].ukt_total;
+    } catch (err) {
+        console.error('Gagal mengambil data tagihan:', err);
+        return res.status(500).json({ status: 'error', message: 'Gagal memproses pembayaran.', data: null });
+    }
+
+    // Langkah 1: Tandai tagihan jadi Lunas di db_billing
+    try {
+        const [result] = await db.promise().query(
+            "UPDATE tagihan SET ukt_dibayar = ukt_total, status = 'Lunas' WHERE nim = ? AND status != 'Lunas'",
+            [nim]
+        );
         if (result.affectedRows === 0) {
             return res.status(400).json({ status: 'error', message: 'Tagihan sudah lunas atau tidak ditemukan.', data: null });
         }
+    } catch (err) {
+        console.error('Gagal update tagihan:', err);
+        return res.status(500).json({ status: 'error', message: 'Gagal memproses pembayaran.', data: null });
+    }
 
-        res.status(200).json({ status: 'success', message: 'Pembayaran UKT berhasil diproses!', data: null });
+    // Langkah 2: Catat pengeluaran di pocket-money-service (service-to-service call)
+    // Kalau ini gagal, rollback langsung di sini -- Flutter tidak perlu tahu detailnya,
+    // cukup terima "gagal" dan minta coba lagi nanti.
+    const transaksiPayload = JSON.stringify({
+        nim,
+        nominal: nominalUKT,
+        jenis_transaksi: 'pengeluaran',
+        keterangan: 'Pembayaran UKT Kampus',
+        tanggal: new Date().toISOString().split('T')[0]
     });
+
+    const pocketMoneyHost = process.env.POCKET_MONEY_HOST || 'pocket-money-service';
+    const pocketMoneyPort = process.env.POCKET_MONEY_PORT || 4003;
+
+    const berhasilCatatTransaksi = await new Promise((resolve) => {
+        const options = {
+            hostname: pocketMoneyHost,
+            port: pocketMoneyPort,
+            path: '/transaksi',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(transaksiPayload),
+                // Teruskan identitas user ke pocket-money-service
+                'x-user-nim': req.headers['x-user-nim'],
+                'x-user-role': req.headers['x-user-role']
+            }
+        };
+
+        const reqPocket = http.request(options, (resPocket) => {
+            resolve(resPocket.statusCode === 200 || resPocket.statusCode === 201);
+        });
+
+        reqPocket.on('error', (e) => {
+            console.error(`Gagal memanggil pocket-money-service: ${e.message}`);
+            resolve(false);
+        });
+
+        // Timeout 8 detik -- kalau pocket-money-service tidak merespons, anggap gagal
+        reqPocket.setTimeout(8000, () => {
+            reqPocket.destroy();
+            resolve(false);
+        });
+
+        reqPocket.write(transaksiPayload);
+        reqPocket.end();
+    });
+
+    if (!berhasilCatatTransaksi) {
+        // Langkah 3b: Pocket-money-service gagal -- rollback tagihan di server
+        console.error(`Rollback pembayaran UKT untuk NIM ${nim}: pencatatan transaksi gagal.`);
+        try {
+            await db.promise().query(
+                "UPDATE tagihan SET ukt_dibayar = 0, status = 'Belum Lunas' WHERE nim = ? AND status = 'Lunas'",
+                [nim]
+            );
+            console.log(`Rollback NIM ${nim} berhasil.`);
+        } catch (rollbackErr) {
+            // Rollback di server juga gagal -- ini kasus ekstrem (database down)
+            // yang membutuhkan pengecekan manual oleh admin.
+            console.error(`⚠️ KRITIS: Rollback tagihan NIM ${nim} GAGAL:`, rollbackErr.message);
+        }
+        return res.status(503).json({
+            status: 'error',
+            message: 'Pembayaran gagal: layanan pencatatan transaksi tidak tersedia. Tagihan tidak berubah, silakan coba lagi.',
+            data: null
+        });
+    }
+
+    // Langkah 3a: Semua berhasil
+    res.status(200).json({ status: 'success', message: 'Pembayaran UKT berhasil diproses!', data: null });
+});
+
+// --- ENDPOINT ROLLBACK MANUAL (ADMIN ONLY) ---
+// Dipertahankan sebagai safety net untuk kasus ekstrem -- misalnya rollback
+// otomatis di atas ikut gagal karena database down. Admin bisa panggil ini
+// secara manual untuk membetulkan data yang kacau.
+app.put('/tagihan/:nim/batal-bayar', requireAdmin, (req, res) => {
+    const nim = req.params.nim;
+
+    db.query(
+        "UPDATE tagihan SET ukt_dibayar = 0, status = 'Belum Lunas' WHERE nim = ? AND status = 'Lunas'",
+        [nim],
+        (err, result) => {
+            if (err) {
+                console.error('Gagal rollback manual:', err);
+                return res.status(500).json({ status: 'error', message: 'Gagal membatalkan pembayaran.', data: null });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(400).json({ status: 'error', message: 'Tidak ada tagihan lunas yang bisa dibatalkan untuk NIM ini.', data: null });
+            }
+            res.status(200).json({ status: 'success', message: 'Pembayaran UKT berhasil dibatalkan (rollback manual oleh admin).', data: null });
+        }
+    );
 });
 
 // Ditambahkan '0.0.0.0' agar aman untuk jaringan Docker

@@ -1,51 +1,62 @@
 services:
-  # 1. DATABASE MYSQL (Healthcheck Ditambahkan)
+  # 1. DATABASE MYSQL (satu container, tiga database terpisah per service)
   kampus-db:
     image: mysql:8.0
     container_name: kampus-db-container
-    environment:
-      MYSQL_ROOT_PASSWORD: rahasia_db_password
-      MYSQL_DATABASE: db_pocket_money
+    env_file: .env
     ports:
       - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
+      - ./init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASSWORD}"]
       interval: 5s
       timeout: 10s
       retries: 10
       start_period: 10s
 
-  # 2. MICROSERVICE: AUTH (Menunggu MySQL siap)
+  # 2. MICROSERVICE: AUTH (database sendiri: db_auth)
   auth-service:
     build: ./auth-service
     ports:
       - "4001:4001"
+    env_file: .env
     environment:
       - PORT=4001
+      - DB_HOST=kampus-db
+      - DB_USER=root
+      - DB_NAME=db_auth
     depends_on:
       kampus-db:
         condition: service_healthy
 
-  # 3. MICROSERVICE: KAMPUS BILLING (Menunggu MySQL siap)
+  # 3. MICROSERVICE: KAMPUS BILLING (database sendiri: db_billing)
   campus-billing-service:
     build: ./campus-billing-service
     ports:
       - "4002:4002"
+    env_file: .env
     environment:
       - PORT=4002
+      - DB_HOST=kampus-db
+      - DB_USER=root
+      - DB_NAME=db_billing
     depends_on:
       kampus-db:
         condition: service_healthy
 
-  # 4. MICROSERVICE: POCKET MONEY (Menunggu MySQL siap)
+  # 4. MICROSERVICE: POCKET MONEY (database sendiri: db_pocket_money)
   pocket-money-service:
     build: ./pocket-money-service
     ports:
       - "4003:4003"
+    env_file: .env
     environment:
       - PORT=4003
+      - DB_HOST=kampus-db
+      - DB_USER=root
+      - DB_NAME=db_pocket_money
     depends_on:
       kampus-db:
         condition: service_healthy
@@ -55,6 +66,7 @@ services:
     build: ./api-gateway
     ports:
       - "4000:4000"
+    env_file: .env
     environment:
       - PORT=4000
     depends_on:

@@ -1,13 +1,19 @@
+import 'dotenv/config';
 import express from 'express';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import cors from 'cors';
 import jwt from 'jsonwebtoken'; // Pindahkan import ke atas agar performa stabil
 
 const app = express();
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
 
 // Kunci stempel harus SAMA PERSIS dengan yang ada di Auth Service!
-const JWT_SECRET = 'rahasia_super_helena_finance_2026';
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+    console.error('❌ JWT_SECRET tidak ditemukan di environment variables. Cek file .env!');
+    process.exit(1);
+}
 
 // 1. CORS HARUS DI ATAS SEBELUM RUTE APAPUN
 app.use(cors({
@@ -57,24 +63,55 @@ const verifyToken = (req, res, next) => {
 
 // --- ROUTING API GATEWAY ---
 
-// Rute Login: TIDAK PERLU SATPAM
+// Rute Login & Register: TIDAK PERLU SATPAM (belum punya token saat ini)
 app.use('/auth', createProxyMiddleware({ 
     target: 'http://auth-service:4001', 
     changeOrigin: true,
     onError: proxyErrorHandler // Tambahkan jaring pengaman error
 }));
 
+// Rute KHUSUS endpoint auth-service yang butuh login (mis. GET /users untuk admin).
+// Path di sini ('/auth-protected/users' -> diteruskan sebagai '/users') supaya
+// tidak bentrok dengan '/auth' di atas yang sengaja terbuka untuk login/register.
+app.use('/auth-protected', verifyToken, createProxyMiddleware({
+    target: 'http://auth-service:4001',
+    changeOrigin: true,
+    onError: proxyErrorHandler,
+    pathRewrite: { '^/auth-protected': '' },
+    on: {
+        proxyReq: (proxyReq, req) => {
+            proxyReq.setHeader('x-user-nim', req.user.nim);
+            proxyReq.setHeader('x-user-role', req.user.role);
+        }
+    }
+}));
+
 // Rute Tagihan & Uang Saku: WAJIB DIJAGA SATPAM (`verifyToken`)
+// Identitas user yang sudah terverifikasi diteruskan via header internal,
+// supaya service di belakang bisa mengecek otorisasi level data (anti-IDOR)
+// tanpa perlu verifikasi JWT lagi.
 app.use('/kampus', verifyToken, createProxyMiddleware({ 
     target: 'http://campus-billing-service:4002', 
     changeOrigin: true,
-    onError: proxyErrorHandler
+    onError: proxyErrorHandler,
+    on: {
+        proxyReq: (proxyReq, req) => {
+            proxyReq.setHeader('x-user-nim', req.user.nim);
+            proxyReq.setHeader('x-user-role', req.user.role);
+        }
+    }
 }));
 
 app.use('/uang-saku', verifyToken, createProxyMiddleware({ 
     target: 'http://pocket-money-service:4003', 
     changeOrigin: true,
-    onError: proxyErrorHandler
+    onError: proxyErrorHandler,
+    on: {
+        proxyReq: (proxyReq, req) => {
+            proxyReq.setHeader('x-user-nim', req.user.nim);
+            proxyReq.setHeader('x-user-role', req.user.role);
+        }
+    }
 }));
 
 app.listen(PORT, '0.0.0.0', () => {
