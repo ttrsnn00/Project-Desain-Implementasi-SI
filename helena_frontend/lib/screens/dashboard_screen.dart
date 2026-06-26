@@ -1,13 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'; 
 import 'package:provider/provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:intl/intl.dart';
 
 import '../providers/keuangan_provider.dart';
 import '../config/api_config.dart';
+import '../utils/token_storage.dart';
 import 'login_screen.dart';
 import 'profile_screen.dart'; 
 
@@ -51,8 +51,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   // --- FUNGSI LOGOUT ---
   Future<void> _logout() async {
-    SharedPreferences prefs = await SharedPreferences.getInstance();
-    await prefs.remove('token');
+    await TokenStorage.deleteToken();
+    await TokenStorage.deleteRole();
     if (mounted) {
       Navigator.pushReplacement(
         context,
@@ -94,8 +94,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     Navigator.pop(context);
     
     try {
-      SharedPreferences prefs = await SharedPreferences.getInstance();
-      String? token = prefs.getString('token');
+      String? token = await TokenStorage.getToken();
       
       final response = await http.post(
         Uri.parse('${ApiConfig.baseUrl}/uang-saku/transaksi'),
@@ -280,6 +279,51 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
+                    // Banner warning: muncul hanya kalau salah satu service tidak bisa diakses
+                    if (!provider.isPocketMoneyAvailable)
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: Colors.orange[50],
+                          border: Border.all(color: Colors.orange.shade300),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.wifi_off, color: Colors.orange[700], size: 18),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                'Layanan uang saku sedang tidak tersedia. Data saldo & riwayat tidak dapat dimuat.',
+                                style: TextStyle(color: Colors.orange[800], fontSize: 13),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    if (!provider.isTagihanAvailable)
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: Colors.red[50],
+                          border: Border.all(color: Colors.red.shade300),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.wifi_off, color: Colors.red[700], size: 18),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                'Layanan tagihan kampus sedang tidak tersedia. Data UKT tidak dapat dimuat.',
+                                style: TextStyle(color: Colors.red[800], fontSize: 13),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
                     Container(
                       padding: const EdgeInsets.all(20),
                       decoration: BoxDecoration(
@@ -384,7 +428,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                 SizedBox(
                                   width: double.infinity,
                                   child: ElevatedButton(
-                                    onPressed: () async {
+                                    // Disable tombol kalau pocket-money-service mati:
+                                    // saldoTotal akan 0 bukan karena saldo memang 0,
+                                    // tapi karena data tidak bisa diambil. Membiarkan
+                                    // user bayar dalam kondisi ini misleading.
+                                    onPressed: !provider.isPocketMoneyAvailable
+                                        ? () {
+                                            ScaffoldMessenger.of(context).showSnackBar(
+                                              const SnackBar(
+                                                content: Text('⚠️ Layanan uang saku tidak tersedia. Pembayaran ditunda.'),
+                                                backgroundColor: Colors.orange,
+                                              ),
+                                            );
+                                          }
+                                        : () async {
                                       HapticFeedback.heavyImpact(); 
                                       
                                       int nominalTagihan = provider.tagihan!['ukt_total'];

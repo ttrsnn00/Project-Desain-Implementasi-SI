@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/api_config.dart';
+import '../utils/token_storage.dart';
 
 class ProfileScreen extends StatefulWidget {
   final String nim;
@@ -32,8 +32,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
     });
 
     try {
-      SharedPreferences prefs = await SharedPreferences.getInstance();
-      String? token = prefs.getString('token');
+      String? token = await TokenStorage.getToken();
 
       final response = await http.put(
         Uri.parse('${ApiConfig.baseUrl}/auth/profile'),
